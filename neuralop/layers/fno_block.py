@@ -1,4 +1,4 @@
-from typing import List, Union
+from typing import List, Union, Optional, Literal
 
 import torch
 from torch import nn
@@ -9,6 +9,7 @@ from .complex import CGELU, ctanh, ComplexValued
 from .normalization_layers import AdaIN, InstanceNorm, BatchNorm
 from .skip_connections import skip_connection
 from .spectral_convolution import SpectralConv
+from .mhc import mHC_FNO_Block
 from ..utils import validate_scaling_factor
 
 
@@ -439,3 +440,353 @@ class SubModule(nn.Module):
 
     def forward(self, x):
         return self.main_module.forward(x, self.indices)
+
+
+class FNOBlocks_mHC(FNOBlocks):
+    """
+    FNOBlocks with Manifold Hyper-Connection (mHC) support.
+
+    This class extends the standard FNOBlocks by adding an optional mHC branch
+    as a third parallel pathway alongside spectral convolution and channel MLP branches.
+
+    The mHC branch implements dual-mode Sinkhorn-Knopp algorithm with continuous
+    kernel density balancing (KDB) for enhanced manifold-based feature mixing.
+
+    Parameters
+    ----------
+    in_channels : int
+        Number of input channels to Fourier layers
+    out_channels : int
+        Number of output channels after Fourier layers
+    n_modes : int or List[int]
+        Number of modes to keep along each dimension in frequency space
+    use_mhc : bool, optional
+        Whether to enable the mHC branch, by default False
+    mhc_mode : Literal["discrete", "continuous"], optional
+        Mode for mHC operation, by default "continuous"
+    mhc_expansion_ratio : int, optional
+        Expansion ratio for manifold (n in n×C), by default 4
+    mhc_sinkhorn_iter : int, optional
+        Number of Sinkhorn iterations, by default 20
+    mhc_kdb_bandwidth : float, optional
+        Bandwidth for kernel density balancing, by default 1.0
+    mhc_kernel_size : int, optional
+        Size of truncated kernel for KDB, by default 5
+
+    All other parameters are inherited from FNOBlocks and maintain the same defaults.
+
+    Notes
+    -----
+    When use_mhc=True, the block has three parallel branches:
+    1. SpectralConv (frequency domain global integration)
+    2. ChannelMLP (spatial domain local linear)
+    3. mHC (manifold hyper-connection with dual-mode Sinkhorn)
+
+    The outputs are summed together (residual connection) to enable seamless integration.
+    """
+
+    def __init__(
+        self,
+        in_channels,
+        out_channels,
+        n_modes,
+        use_mhc: bool = False,
+        mhc_mode: Literal["discrete", "continuous"] = "continuous",
+        mhc_expansion_ratio: int = 4,
+        mhc_sinkhorn_iter: int = 20,
+        mhc_kdb_bandwidth: float = 0.5,  # Reduced bandwidth
+        mhc_kernel_size: int = 5,
+        mhc_padding_mode: Literal["circular", "replicate", "zeros"] = "circular",  # Prevents mass leakage
+        **kwargs,
+    ):
+        # Initialize parent FNOBlocks with all standard parameters
+        super().__init__(
+            in_channels=in_channels,
+            out_channels=out_channels,
+            n_modes=n_modes,
+            **kwargs
+        )
+
+        self.use_mhc = use_mhc
+        self.mhc_mode = mhc_mode
+
+        # Initialize mHC blocks for each layer if enabled
+        if use_mhc:
+            self.mhc_blocks = nn.ModuleList([
+                mHC_FNO_Block(
+                    in_channels=self.in_channels,
+                    out_channels=self.out_channels,
+                    mhc_expansion_ratio=mhc_expansion_ratio,
+                    sinkhorn_iter=mhc_sinkhorn_iter,
+                    kdb_bandwidth=mhc_kdb_bandwidth,
+                    kernel_size=mhc_kernel_size,
+                    mode=mhc_mode,
+                )
+                for _ in range(self.n_layers)
+            ])
+
+            # Create skip connections for mHC branch
+            if self.fno_skip is not None:
+                self.mhc_skips = nn.ModuleList([
+                    skip_connection(
+                        self.in_channels,
+                        self.out_channels,
+                        skip_type=self.fno_skip,
+                        n_dim=self.n_dim,
+                    )
+                    for _ in range(self.n_layers)
+                ])
+                if self.complex_data:
+                    self.mhc_skips = nn.ModuleList([ComplexValued(x) for x in self.mhc_skips])
+            else:
+                self.mhc_skips = None
+
+            # Additional normalization for mHC branch
+            if self.norm is not None:
+                # We already have 2 norms per layer (for FNO and ChannelMLP)
+                # Add 2 more for mHC branch: one before, one after
+                if isinstance(self.norm, nn.ModuleList):
+                    # Extend the existing norm list with additional norms for mHC
+                    for _ in range(self.n_layers * 2):  # 2 additional norms per layer
+                        if self.norm[0].__class__.__name__ == "InstanceNorm":
+                            self.norm.append(InstanceNorm())
+                        elif self.norm[0].__class__.__name__ == "GroupNorm":
+                            self.norm.append(
+                                nn.GroupNorm(num_groups=1, num_channels=self.out_channels)
+                            )
+                        elif self.norm[0].__class__.__name__ == "BatchNorm":
+                            self.norm.append(
+                                BatchNorm(n_dim=self.n_dim, num_features=self.out_channels)
+                            )
+                        elif self.norm[0].__class__.__name__ == "AdaIN":
+                            self.norm.append(AdaIN(self.ada_in_features, out_channels))
+                    # Update the total norm count
+                    self.n_norms = 4  # Now 4 norms per layer
+                    if self.complex_data:
+                        # Complex-wrap the newly added norms
+                        for i in range(self.n_layers * 2, self.n_layers * 4):
+                            self.norm[i] = ComplexValued(self.norm[i])
+
+    def forward_with_postactivation(self, x, index=0, output_shape=None, return_stats=False):
+        """
+        Forward pass with post-activation and mHC branch support.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            Input tensor of shape (B, C, H, W)
+        index : int, optional
+            Layer index, by default 0
+        output_shape : tuple, optional
+            Output shape for super-resolution, by default None
+        return_stats : bool, optional
+            Whether to return Sinkhorn statistics, by default False
+
+        Returns
+        -------
+        torch.Tensor or Tuple[torch.Tensor, Optional[dict]]
+            Output tensor and optionally statistics dict
+        """
+        stats = None
+
+        if self.fno_skips is not None:
+            x_skip_fno = self.fno_skips[index](x)
+            x_skip_fno = self.convs[index].transform(x_skip_fno, output_shape=output_shape)
+
+        if self.use_channel_mlp and self.channel_mlp_skips is not None:
+            x_skip_channel_mlp = self.channel_mlp_skips[index](x)
+            x_skip_channel_mlp = self.convs[index].transform(x_skip_channel_mlp, output_shape=output_shape)
+
+        if self.stabilizer == "tanh":
+            if self.complex_data:
+                x = ctanh(x)
+            else:
+                x = torch.tanh(x)
+
+        # FNO spectral convolution branch
+        x_fno = self.convs[index](x, output_shape=output_shape)
+
+        if self.norm is not None:
+            x_fno = self.norm[self.n_norms * index](x_fno)
+
+        x = x_fno + x_skip_fno if self.fno_skips is not None else x_fno
+
+        if index < (self.n_layers - 1):
+            x = self.non_linearity(x)
+
+        # Channel MLP branch
+        if self.use_channel_mlp:
+            if self.channel_mlp_skips is not None:
+                x = self.channel_mlp[index](x) + x_skip_channel_mlp
+            else:
+                x = self.channel_mlp[index](x)
+
+            if self.norm is not None:
+                # Norm index: layer * n_norms + 1 (second norm for this layer)
+                x = self.norm[self.n_norms * index + 1](x)
+
+            if index < (self.n_layers - 1):
+                x = self.non_linearity(x)
+
+        # mHC branch (third parallel pathway)
+        if self.use_mhc:
+            # Apply mHC skip connection if enabled
+            if self.mhc_skips is not None:
+                x_skip_mhc = self.mhc_skips[index](x)
+                x_skip_mhc = self.convs[index].transform(x_skip_mhc, output_shape=output_shape)
+                x_mhc_input = x_skip_mhc
+            else:
+                x_mhc_input = x
+
+            # Apply mHC block
+            x_mhc, mhc_stats = self.mhc_blocks[index](
+                x_mhc_input,
+                return_stats=return_stats
+            )
+
+            # Apply normalization to mHC output
+            if self.norm is not None:
+                # Norm indices: layer * n_norms + 2 and layer * n_norms + 3
+                x_mhc = self.norm[self.n_norms * index + 2](x_mhc)
+
+                if index < (self.n_layers - 1):
+                    x_mhc = self.non_linearity(x_mhc)
+                    x_mhc = self.norm[self.n_norms * index + 3](x_mhc)
+
+            # Add mHC output to existing features (residual connection)
+            x = x + x_mhc
+
+            # Collect statistics if requested
+            if return_stats and mhc_stats is not None:
+                stats = mhc_stats
+
+        if index < (self.n_layers - 1):
+            x = self.non_linearity(x)
+
+        if return_stats:
+            return x, stats
+        return x
+
+    def forward_with_preactivation(self, x, index=0, output_shape=None, return_stats=False):
+        """
+        Forward pass with pre-activation and mHC branch support.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            Input tensor of shape (B, C, H, W)
+        index : int, optional
+            Layer index, by default 0
+        output_shape : tuple, optional
+            Output shape for super-resolution, by default None
+        return_stats : bool, optional
+            Whether to return Sinkhorn statistics, by default False
+
+        Returns
+        -------
+        torch.Tensor or Tuple[torch.Tensor, Optional[dict]]
+            Output tensor and optionally statistics dict
+        """
+        stats = None
+
+        # Apply non-linear activation (and norm) before this block's convolution/forward pass
+        x = self.non_linearity(x)
+
+        if self.norm is not None:
+            x = self.norm[self.n_norms * index](x)
+
+        if self.fno_skips is not None:
+            x_skip_fno = self.fno_skips[index](x)
+            x_skip_fno = self.convs[index].transform(x_skip_fno, output_shape=output_shape)
+
+        if self.use_channel_mlp and self.channel_mlp_skips is not None:
+            x_skip_channel_mlp = self.channel_mlp_skips[index](x)
+            x_skip_channel_mlp = self.convs[index].transform(x_skip_channel_mlp, output_shape=output_shape)
+
+        if self.stabilizer == "tanh":
+            if self.complex_data:
+                x = ctanh(x)
+            else:
+                x = torch.tanh(x)
+
+        # FNO spectral convolution branch
+        x_fno = self.convs[index](x, output_shape=output_shape)
+
+        x = x_fno + x_skip_fno if self.fno_skips is not None else x_fno
+
+        if index < (self.n_layers - 1):
+            x = self.non_linearity(x)
+
+        if self.norm is not None:
+            x = self.norm[self.n_norms * index + 1](x)
+
+        # Channel MLP branch
+        if self.use_channel_mlp:
+            if self.channel_mlp_skips is not None:
+                x = self.channel_mlp[index](x) + x_skip_channel_mlp
+            else:
+                x = self.channel_mlp[index](x)
+
+            if index < (self.n_layers - 1):
+                x = self.non_linearity(x)
+
+        # mHC branch (third parallel pathway)
+        if self.use_mhc:
+            # Apply mHC skip connection if enabled
+            if self.mhc_skips is not None:
+                x_skip_mhc = self.mhc_skips[index](x)
+                x_skip_mhc = self.convs[index].transform(x_skip_mhc, output_shape=output_shape)
+                x_mhc_input = x_skip_mhc
+            else:
+                x_mhc_input = x
+
+            # Apply mHC block
+            x_mhc, mhc_stats = self.mhc_blocks[index](
+                x_mhc_input,
+                return_stats=return_stats
+            )
+
+            # Apply normalization to mHC output
+            if self.norm is not None:
+                # Norm indices: layer * n_norms + 2 and layer * n_norms + 3
+                x_mhc = self.norm[self.n_norms * index + 2](x_mhc)
+
+                if index < (self.n_layers - 1):
+                    x_mhc = self.non_linearity(x_mhc)
+                    x_mhc = self.norm[self.n_norms * index + 3](x_mhc)
+
+            # Add mHC output to existing features (residual connection)
+            x = x + x_mhc
+
+            # Collect statistics if requested
+            if return_stats and mhc_stats is not None:
+                stats = mhc_stats
+
+        if return_stats:
+            return x, stats
+        return x
+
+    def forward(self, x, index=0, output_shape=None, return_stats=False):
+        """
+        Forward pass with optional statistics return.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            Input tensor of shape (B, C, H, W)
+        index : int, optional
+            Layer index, by default 0
+        output_shape : tuple, optional
+            Output shape for super-resolution, by default None
+        return_stats : bool, optional
+            Whether to return Sinkhorn statistics, by default False
+
+        Returns
+        -------
+        torch.Tensor or Tuple[torch.Tensor, Optional[dict]]
+            Output tensor and optionally statistics dict
+        """
+        if self.preactivation:
+            return self.forward_with_preactivation(x, index, output_shape, return_stats)
+        else:
+            return self.forward_with_postactivation(x, index, output_shape, return_stats)

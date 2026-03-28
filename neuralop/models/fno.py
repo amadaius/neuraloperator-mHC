@@ -1,5 +1,5 @@
 from functools import partialmethod
-from typing import Tuple, List, Union, Literal
+from typing import Tuple, List, Union, Literal, Optional
 
 Number = Union[float, int]
 
@@ -16,7 +16,7 @@ warnings.filterwarnings("once", category=UserWarning)
 from ..layers.embeddings import GridEmbeddingND, GridEmbedding2D
 from ..layers.spectral_convolution import SpectralConv
 from ..layers.padding import DomainPadding
-from ..layers.fno_block import FNOBlocks
+from ..layers.fno_block import FNOBlocks, FNOBlocks_mHC
 from ..layers.channel_mlp import ChannelMLP
 from ..layers.complex import ComplexValued
 from .base_model import BaseModel
@@ -142,6 +142,24 @@ class FNO(BaseModel, name="FNO"):
         frequency and Nyquist frequency are real-valued before calling irfft. When False,
         relies on cuFFT's irfftn to handle symmetry automatically, which may fail on
         certain GPUs or input sizes, causing line artifacts. By default True.
+    use_mhc : bool, optional
+        Whether to enable Manifold Hyper-Connection (mHC) branch. When True, adds a third
+        parallel pathway alongside spectral convolution and channel MLP branches. Default: False.
+    mhc_mode : Literal["discrete", "continuous"], optional
+        Mode for mHC operation. "discrete": traditional channel-wise Sinkhorn iterations.
+        "continuous": continuous KDB with spatial smoothing using depthwise conv. Default: "continuous".
+    mhc_expansion_ratio : int, optional
+        Expansion ratio for manifold (n in n×C). Controls the dimensionality of the
+        dual-stochastic constraint space. Default: 4.
+    mhc_sinkhorn_iter : int, optional
+        Number of Sinkhorn iterations for bistochastic projection. Fixed at 20 for
+        stable performance with torch.compile and DDP. Default: 20.
+    mhc_kdb_bandwidth : float, optional
+        Bandwidth for kernel density balancing in continuous mode. Controls the spatial
+        smoothing scale of the Gaussian kernel. Default: 1.0.
+    mhc_kernel_size : int, optional
+        Size of truncated kernel for KDB in continuous mode. Must be odd for
+        symmetric padding. Default: 5.
 
     Examples
     --------
@@ -199,6 +217,13 @@ class FNO(BaseModel, name="FNO"):
         preactivation: bool = False,
         conv_module: nn.Module = SpectralConv,
         enforce_hermitian_symmetry: bool = True,
+        use_mhc: bool = False,
+        mhc_mode: Literal["discrete", "continuous"] = "continuous",
+        mhc_expansion_ratio: int = 4,
+        mhc_sinkhorn_iter: int = 20,
+        mhc_kdb_bandwidth: float = 0.5,  # Reduced from 1.0 to reduce smoothing conflict
+        mhc_kernel_size: int = 5,
+        mhc_padding_mode: Literal["circular", "replicate", "zeros"] = "circular",  # Prevents mass leakage
     ):
         if decomposition_kwargs is None:
             decomposition_kwargs = {}
@@ -233,6 +258,15 @@ class FNO(BaseModel, name="FNO"):
         self.preactivation = preactivation
         self.complex_data = complex_data
         self.fno_block_precision = fno_block_precision
+
+        # mHC parameters
+        self.use_mhc = use_mhc
+        self.mhc_mode = mhc_mode
+        self.mhc_expansion_ratio = mhc_expansion_ratio
+        self.mhc_sinkhorn_iter = mhc_sinkhorn_iter
+        self.mhc_kdb_bandwidth = mhc_kdb_bandwidth
+        self.mhc_kernel_size = mhc_kernel_size
+        self.mhc_padding_mode = mhc_padding_mode
 
         ## Positional embedding
         if positional_embedding == "grid":
@@ -278,33 +312,71 @@ class FNO(BaseModel, name="FNO"):
         self.resolution_scaling_factor = resolution_scaling_factor
 
         ## FNO blocks
-        self.fno_blocks = FNOBlocks(
-            in_channels=hidden_channels,
-            out_channels=hidden_channels,
-            n_modes=self.n_modes,
-            resolution_scaling_factor=resolution_scaling_factor,
-            use_channel_mlp=use_channel_mlp,
-            channel_mlp_dropout=channel_mlp_dropout,
-            channel_mlp_expansion=channel_mlp_expansion,
-            non_linearity=non_linearity,
-            stabilizer=stabilizer,
-            norm=norm,
-            preactivation=preactivation,
-            fno_skip=fno_skip,
-            channel_mlp_skip=channel_mlp_skip,
-            complex_data=complex_data,
-            max_n_modes=max_n_modes,
-            fno_block_precision=fno_block_precision,
-            rank=rank,
-            fixed_rank_modes=fixed_rank_modes,
-            implementation=implementation,
-            separable=separable,
-            factorization=factorization,
-            decomposition_kwargs=decomposition_kwargs,
-            conv_module=conv_module,
-            n_layers=n_layers,
-            enforce_hermitian_symmetry=enforce_hermitian_symmetry,
-        )
+        # Choose between standard FNOBlocks and mHC-enhanced version
+        if use_mhc:
+            self.fno_blocks = FNOBlocks_mHC(
+                in_channels=hidden_channels,
+                out_channels=hidden_channels,
+                n_modes=self.n_modes,
+                resolution_scaling_factor=resolution_scaling_factor,
+                use_channel_mlp=use_channel_mlp,
+                channel_mlp_dropout=channel_mlp_dropout,
+                channel_mlp_expansion=channel_mlp_expansion,
+                non_linearity=non_linearity,
+                stabilizer=stabilizer,
+                norm=norm,
+                preactivation=preactivation,
+                fno_skip=fno_skip,
+                channel_mlp_skip=channel_mlp_skip,
+                complex_data=complex_data,
+                max_n_modes=max_n_modes,
+                fno_block_precision=fno_block_precision,
+                rank=rank,
+                fixed_rank_modes=fixed_rank_modes,
+                implementation=implementation,
+                separable=separable,
+                factorization=factorization,
+                decomposition_kwargs=decomposition_kwargs,
+                conv_module=conv_module,
+                n_layers=n_layers,
+                enforce_hermitian_symmetry=enforce_hermitian_symmetry,
+                # mHC-specific parameters
+                use_mhc=use_mhc,
+                mhc_mode=mhc_mode,
+                mhc_expansion_ratio=mhc_expansion_ratio,
+                mhc_sinkhorn_iter=mhc_sinkhorn_iter,
+                mhc_kdb_bandwidth=mhc_kdb_bandwidth,
+                mhc_kernel_size=mhc_kernel_size,
+                mhc_padding_mode=mhc_padding_mode,  # Prevents mass leakage
+            )
+        else:
+            self.fno_blocks = FNOBlocks(
+                in_channels=hidden_channels,
+                out_channels=hidden_channels,
+                n_modes=self.n_modes,
+                resolution_scaling_factor=resolution_scaling_factor,
+                use_channel_mlp=use_channel_mlp,
+                channel_mlp_dropout=channel_mlp_dropout,
+                channel_mlp_expansion=channel_mlp_expansion,
+                non_linearity=non_linearity,
+                stabilizer=stabilizer,
+                norm=norm,
+                preactivation=preactivation,
+                fno_skip=fno_skip,
+                channel_mlp_skip=channel_mlp_skip,
+                complex_data=complex_data,
+                max_n_modes=max_n_modes,
+                fno_block_precision=fno_block_precision,
+                rank=rank,
+                fixed_rank_modes=fixed_rank_modes,
+                implementation=implementation,
+                separable=separable,
+                factorization=factorization,
+                decomposition_kwargs=decomposition_kwargs,
+                conv_module=conv_module,
+                n_layers=n_layers,
+                enforce_hermitian_symmetry=enforce_hermitian_symmetry,
+            )
 
         ## Lifting layer
         # if adding a positional embedding, add those channels to lifting
@@ -334,7 +406,7 @@ class FNO(BaseModel, name="FNO"):
         if self.complex_data:
             self.projection = ComplexValued(self.projection)
 
-    def forward(self, x, output_shape=None, **kwargs):
+    def forward(self, x, output_shape=None, return_stats=False, **kwargs):
         """FNO's forward pass
 
         1. Applies optional positional encoding
@@ -362,10 +434,23 @@ class FNO(BaseModel, name="FNO"):
             * If tuple, specifies the output-shape of the **last** FNO Block
 
             * If tuple list, specifies the exact output-shape of each FNO Block
+
+        return_stats : bool, optional
+            Whether to return statistics from mHC branch (if enabled). Default: False.
+            Only valid when use_mhc=True.
+
+        Returns
+        -------
+        tensor or tuple
+            If return_stats=False: output tensor
+            If return_stats=True: (output tensor, statistics dict)
         """
-        if kwargs:
+        # Handle unexpected kwargs but allow return_stats
+        valid_kwargs = {'return_stats'}
+        unexpected_kwargs = set(kwargs.keys()) - valid_kwargs
+        if unexpected_kwargs:
             warnings.warn(
-                f"FNO.forward() received unexpected keyword arguments: {list(kwargs.keys())}. "
+                f"FNO.forward() received unexpected keyword arguments: {list(unexpected_kwargs)}. "
                 "These arguments will be ignored.",
                 UserWarning,
                 stacklevel=2,
@@ -385,14 +470,26 @@ class FNO(BaseModel, name="FNO"):
         if self.domain_padding is not None:
             x = self.domain_padding.pad(x)
 
+        # Collect statistics from mHC if enabled and requested
+        all_stats = {}
+
         for layer_idx in range(self.n_layers):
-            x = self.fno_blocks(x, layer_idx, output_shape=output_shape[layer_idx])
+            if self.use_mhc and return_stats:
+                x, layer_stats = self.fno_blocks(
+                    x, layer_idx, output_shape=output_shape[layer_idx], return_stats=return_stats
+                )
+                if layer_stats is not None:
+                    all_stats[f'layer_{layer_idx}'] = layer_stats
+            else:
+                x = self.fno_blocks(x, layer_idx, output_shape=output_shape[layer_idx])
 
         if self.domain_padding is not None:
             x = self.domain_padding.unpad(x)
 
         x = self.projection(x)
 
+        if return_stats and self.use_mhc:
+            return x, all_stats
         return x
 
     @property
