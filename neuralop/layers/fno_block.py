@@ -639,10 +639,15 @@ class FNOBlocks_mHC(FNOBlocks):
                 x_mhc_input = x
 
             # Apply mHC block
-            x_mhc, mhc_stats = self.mhc_blocks[index](
+            mhc_result = self.mhc_blocks[index](
                 x_mhc_input,
                 return_stats=return_stats
             )
+            if return_stats:
+                x_mhc, mhc_stats = mhc_result
+            else:
+                x_mhc = mhc_result
+                mhc_stats = None
 
             # Apply normalization to mHC output
             if self.norm is not None:
@@ -741,10 +746,15 @@ class FNOBlocks_mHC(FNOBlocks):
                 x_mhc_input = x
 
             # Apply mHC block
-            x_mhc, mhc_stats = self.mhc_blocks[index](
+            mhc_result = self.mhc_blocks[index](
                 x_mhc_input,
                 return_stats=return_stats
             )
+            if return_stats:
+                x_mhc, mhc_stats = mhc_result
+            else:
+                x_mhc = mhc_result
+                mhc_stats = None
 
             # Apply normalization to mHC output
             if self.norm is not None:
